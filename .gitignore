@@ -1,0 +1,15 @@
+.venv/
+node_modules/
+dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+data/recordings/
+data/renders/
+data/transcriptions/
+data/cache/
+!data/.gitkeep
+!data/recordings/.gitkeep
+!data/renders/.gitkeep
+!data/transcriptions/.gitkeep

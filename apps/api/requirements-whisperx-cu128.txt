@@ -1,0 +1,11 @@
+# Install inside the project virtual environment only:
+# .\.venv\Scripts\python.exe -m pip install --no-cache-dir -r apps/api/requirements.txt
+# .\.venv\Scripts\python.exe -m pip install --no-cache-dir -r apps/api/requirements-whisperx-cu128.txt
+#
+# WhisperX 3.8.x currently constrains torch to ~=2.8.0, so keep CUDA wheels
+# on the matching 2.8.0 line instead of installing the latest torch first.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.8.0+cu128
+torchvision==0.23.0+cu128
+torchaudio==2.8.0+cu128
+whisperx==3.8.6
