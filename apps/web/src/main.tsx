@@ -16,6 +16,7 @@ import {
 import "./styles.css";
 
 const API = "";
+const DEFAULT_WHISPER_PROMPT = "这是中文语音拼接测试，请准确识别人名、短语和标点。";
 
 type Phrase = {
   id: string;
@@ -33,9 +34,41 @@ type Recording = {
   audioUrl: string;
   text: string;
   duration: number;
+  words?: unknown[];
   phrases: Phrase[];
   engine: string;
   engineNote?: string;
+  whisperModel?: string;
+  enableTextPostprocess?: boolean;
+  textPostprocessMode?: string;
+};
+
+type WhisperModelPreset = "small" | "medium" | "large-v3" | "custom";
+
+type RenderSettings = {
+  enableAudioPostprocess: boolean;
+  marginMs: number;
+  enableGainNormalize: boolean;
+  targetDbfs: number;
+  maxGainDb: number;
+  enableClipFade: boolean;
+  fadeMs: number;
+  enableCrossfade: boolean;
+  crossfadeMs: number;
+  enableFinalNormalize: boolean;
+};
+
+const DEFAULT_RENDER_SETTINGS: RenderSettings = {
+  enableAudioPostprocess: false,
+  marginMs: 0,
+  enableGainNormalize: false,
+  targetDbfs: -18,
+  maxGainDb: 8,
+  enableClipFade: false,
+  fadeMs: 0,
+  enableCrossfade: false,
+  crossfadeMs: 0,
+  enableFinalNormalize: false,
 };
 
 type TrackItem =
@@ -76,11 +109,21 @@ function App() {
   const [outputItems, setOutputItems] = useState<TrackItem[]>([]);
   const [manualText, setManualText] = useState("");
   const [autoTranscribe, setAutoTranscribe] = useState(false);
+  const [whisperModelPreset, setWhisperModelPreset] = useState<WhisperModelPreset>("medium");
+  const [customWhisperModel, setCustomWhisperModel] = useState("");
+  const [whisperPrompt, setWhisperPrompt] = useState(DEFAULT_WHISPER_PROMPT);
+  const [enableTextPostprocess, setEnableTextPostprocess] = useState(false);
+  const [renderSettings, setRenderSettings] = useState<RenderSettings>(DEFAULT_RENDER_SETTINGS);
   const [health, setHealth] = useState<Health | null>(null);
   const [busy, setBusy] = useState("");
   const [message, setMessage] = useState("");
   const [selected, setSelected] = useState<{ recordingId: string; phrase: Phrase } | null>(null);
-  const [renderResult, setRenderResult] = useState<{ wavUrl: string; mp3Url: string; durationMs: number } | null>(null);
+  const [renderResult, setRenderResult] = useState<{
+    wavUrl: string;
+    mp3Url: string;
+    durationMs: number;
+    settingsUsed?: RenderSettings;
+  } | null>(null);
   const [recordingNow, setRecordingNow] = useState(false);
   const [micLevel, setMicLevel] = useState(0);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -99,13 +142,66 @@ function App() {
     setRecordings(await res.json());
   }
 
+  async function clearData() {
+    if (!window.confirm("清空所有录音、转写和渲染结果？")) return;
+    setBusy("clear");
+    const res = await fetch(`${API}/api/data`, { method: "DELETE" });
+    if (!res.ok) {
+      setMessage(await responseMessage(res));
+    } else {
+      const result = await res.json();
+      setRecordings([]);
+      setOutputItems([]);
+      setSelected(null);
+      setRenderResult(null);
+      setMessage(`已清理：录音 ${result.deleted.recordings}，转写 ${result.deleted.transcriptions}，渲染 ${result.deleted.renders}`);
+    }
+    setBusy("");
+  }
+
+  function selectedWhisperModel() {
+    return whisperModelPreset === "custom" ? customWhisperModel.trim() || "medium" : whisperModelPreset;
+  }
+
+  function appendTranscriptionSettings(form: FormData) {
+    form.append("manualText", manualText);
+    form.append("autoTranscribe", String(autoTranscribe));
+    form.append("whisperModel", selectedWhisperModel());
+    form.append("whisperPrompt", whisperPrompt.trim() || DEFAULT_WHISPER_PROMPT);
+    form.append("enableTextPostprocess", String(enableTextPostprocess));
+  }
+
+  function updateRenderSettings(patch: Partial<RenderSettings>) {
+    setRenderSettings((prev) => ({ ...prev, ...patch }));
+  }
+
+  function phraseMode(recording: Recording) {
+    const sources = new Set(recording.phrases.map((phrase) => phrase.source || "unknown"));
+    if (recording.textPostprocessMode) return recording.textPostprocessMode;
+    if (sources.has("whisperx-word")) return "raw";
+    if (sources.has("whisperx-postprocess")) return "postprocess";
+    if (sources.has("whisperx")) return "legacy-postprocess";
+    if (sources.has("fallback")) return "fallback";
+    return recording.enableTextPostprocess ? "postprocess" : "unknown";
+  }
+
+  function sourceSummary(recording: Recording) {
+    const counts = recording.phrases.reduce<Record<string, number>>((acc, phrase) => {
+      const source = phrase.source || "unknown";
+      acc[source] = (acc[source] || 0) + 1;
+      return acc;
+    }, {});
+    return Object.entries(counts)
+      .map(([source, count]) => `${source}:${count}`)
+      .join(" / ");
+  }
+
   async function uploadFile(file: File) {
     setBusy("upload");
     setMessage("正在保存并生成短语块...");
     const form = new FormData();
     form.append("file", file);
-    form.append("manualText", manualText);
-    form.append("autoTranscribe", String(autoTranscribe));
+    appendTranscriptionSettings(form);
     const res = await fetch(`${API}/api/recordings`, { method: "POST", body: form });
     if (!res.ok) {
       setMessage(await responseMessage(res));
@@ -114,6 +210,22 @@ function App() {
       setRecordings((prev) => [recording, ...prev]);
       setManualText("");
       setMessage(recording.engineNote || "录音已生成短语块");
+    }
+    setBusy("");
+  }
+
+  async function retranscribe(recordingId: string) {
+    setBusy("transcribe");
+    setMessage("正在重新转写...");
+    const form = new FormData();
+    appendTranscriptionSettings(form);
+    const res = await fetch(`${API}/api/recordings/${recordingId}/transcribe`, { method: "POST", body: form });
+    if (!res.ok) {
+      setMessage(await responseMessage(res));
+    } else {
+      const updated = await res.json();
+      setRecordings((prev) => prev.map((recording) => (recording.id === recordingId ? updated : recording)));
+      setMessage(updated.engineNote || "重新转写完成");
     }
     setBusy("");
   }
@@ -241,6 +353,7 @@ function App() {
           ? { type: "pause", durationMs: item.durationMs }
           : { type: "clip", recordingId: item.recordingId, phraseId: item.phraseId }
       ),
+      settings: renderSettings,
     };
     const res = await fetch(`${API}/api/render`, {
       method: "POST",
@@ -304,12 +417,138 @@ function App() {
             上传
             <input hidden type="file" accept="audio/*" onChange={(event) => event.target.files?.[0] && uploadFile(event.target.files[0])} />
           </label>
+          <button className="danger" onClick={() => void clearData()} disabled={!!busy}>
+            <Trash2 size={18} />
+            清理数据
+          </button>
           <button onClick={() => void refresh()}>
             <RefreshCw size={18} />
             刷新
           </button>
         </div>
       </header>
+
+      <section className="panel settings-panel">
+        <div className="panel-head settings-head">
+          <div>
+            <h2>测试配置</h2>
+            <p>默认保留 WhisperX 原始切分和原始音频包络。</p>
+          </div>
+          <div className="settings-grid">
+            <label className="toggle">
+              <input type="checkbox" checked={autoTranscribe} onChange={(event) => setAutoTranscribe(event.target.checked)} />
+              <span>WhisperX</span>
+            </label>
+            <label>
+              模型
+              <select value={whisperModelPreset} onChange={(event) => setWhisperModelPreset(event.target.value as WhisperModelPreset)}>
+                <option value="small">快速 small</option>
+                <option value="medium">平衡 medium</option>
+                <option value="large-v3">高精度 large-v3</option>
+                <option value="custom">自定义</option>
+              </select>
+            </label>
+            {whisperModelPreset === "custom" && (
+              <label>
+                自定义模型名
+                <input value={customWhisperModel} onChange={(event) => setCustomWhisperModel(event.target.value)} placeholder="medium" />
+              </label>
+            )}
+            <label className="wide">
+              WhisperX initial prompt
+              <input
+                value={whisperPrompt}
+                onChange={(event) => setWhisperPrompt(event.target.value)}
+                placeholder={DEFAULT_WHISPER_PROMPT}
+              />
+            </label>
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={enableTextPostprocess}
+                onChange={(event) => setEnableTextPostprocess(event.target.checked)}
+              />
+              <span>文本后处理</span>
+            </label>
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={renderSettings.enableAudioPostprocess}
+                onChange={(event) => updateRenderSettings({ enableAudioPostprocess: event.target.checked })}
+              />
+              <span>音频后处理</span>
+            </label>
+          </div>
+        </div>
+        {renderSettings.enableAudioPostprocess && (
+          <div className="advanced-settings">
+            <label>
+              marginMs
+              <input
+                type="number"
+                value={renderSettings.marginMs}
+                onChange={(event) => updateRenderSettings({ marginMs: Number(event.target.value) })}
+              />
+            </label>
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={renderSettings.enableGainNormalize}
+                onChange={(event) => updateRenderSettings({ enableGainNormalize: event.target.checked })}
+              />
+              <span>增益归一</span>
+            </label>
+            <label>
+              targetDbfs
+              <input
+                type="number"
+                value={renderSettings.targetDbfs}
+                onChange={(event) => updateRenderSettings({ targetDbfs: Number(event.target.value) })}
+              />
+            </label>
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={renderSettings.enableClipFade}
+                onChange={(event) => updateRenderSettings({ enableClipFade: event.target.checked })}
+              />
+              <span>片段 fade</span>
+            </label>
+            <label>
+              fadeMs
+              <input
+                type="number"
+                value={renderSettings.fadeMs}
+                onChange={(event) => updateRenderSettings({ fadeMs: Number(event.target.value) })}
+              />
+            </label>
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={renderSettings.enableCrossfade}
+                onChange={(event) => updateRenderSettings({ enableCrossfade: event.target.checked })}
+              />
+              <span>连接 crossfade</span>
+            </label>
+            <label>
+              crossfadeMs
+              <input
+                type="number"
+                value={renderSettings.crossfadeMs}
+                onChange={(event) => updateRenderSettings({ crossfadeMs: Number(event.target.value) })}
+              />
+            </label>
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={renderSettings.enableFinalNormalize}
+                onChange={(event) => updateRenderSettings({ enableFinalNormalize: event.target.checked })}
+              />
+              <span>最终 normalize</span>
+            </label>
+          </div>
+        )}
+      </section>
 
       <main className="workspace">
         <section className="panel source-panel">
@@ -330,8 +569,21 @@ function App() {
                 <div className="recording-title">
                   <FileAudio size={18} />
                   <strong>{recording.name}</strong>
-                  <span>{recording.engine}</span>
+                  <span title={recording.engineNote}>
+                    {recording.engine}
+                    {recording.whisperModel ? ` / ${recording.whisperModel}` : ""}
+                    {` / ${phraseMode(recording)}`}
+                  </span>
                   <audio src={recording.audioUrl} controls />
+                </div>
+                <div className="recording-tools">
+                  <small>
+                    words {recording.words?.length ?? 0} / phrases {recording.phrases.length} / {sourceSummary(recording)}
+                  </small>
+                  <button onClick={() => void retranscribe(recording.id)} disabled={!!busy}>
+                    <RefreshCw size={14} />
+                    重新转写
+                  </button>
                 </div>
                 <div className="transcript">{recording.text}</div>
                 <div className="phrases">
@@ -347,7 +599,7 @@ function App() {
                         draggable
                         onDragStart={(event) => onPhraseDrag(event, recording, phrase)}
                         onClick={() => setSelected({ recordingId: recording.id, phrase })}
-                        title={`${phrase.start}s - ${phrase.end}s`}
+                        title={`${phrase.start}s - ${phrase.end}s / ${phrase.source || "unknown"}`}
                       >
                         {phrase.text}
                       </button>

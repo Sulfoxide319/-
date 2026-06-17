@@ -10,6 +10,7 @@ from pydub.exceptions import CouldntDecodeError
 from .storage import new_id
 
 
+DEFAULT_WHISPER_PROMPT = "这是中文语音拼接测试，请准确识别人名、短语和标点。"
 PUNCTUATION = set("，。！？；：,.!?;:")
 PUNCTUATION_PAUSES_MS = {
     "，": 180,
@@ -70,7 +71,12 @@ def _duration_seconds(audio_path: Path) -> float:
     return max(len(audio) / 1000, 0.01)
 
 
-def fallback_transcribe(audio_path: Path, manual_text: str | None = None) -> dict[str, Any]:
+def fallback_transcribe(
+    audio_path: Path,
+    manual_text: str | None = None,
+    whisper_model: str | None = None,
+    enable_text_postprocess: bool = False,
+) -> dict[str, Any]:
     text = normalize_text(manual_text or "") or text_from_filename(audio_path) or "未命名录音"
     units = split_text_units(text) or [text]
     duration = _duration_seconds(audio_path)
@@ -112,6 +118,9 @@ def fallback_transcribe(audio_path: Path, manual_text: str | None = None) -> dic
         "phrases": phrases,
         "engine": "fallback",
         "engineNote": "未检测到 WhisperX 或未请求真实转写，使用手工文本/文件名按时长均分生成短语。",
+        "whisperModel": (whisper_model or "").strip() or "medium",
+        "enableTextPostprocess": enable_text_postprocess,
+        "textPostprocessMode": "fallback",
     }
 
 
@@ -142,7 +151,7 @@ def words_to_phrases(words: list[dict[str, Any]], duration: float) -> list[dict[
                 "end": round(end, 3),
                 "kind": "clip",
                 "quality": quality_for_phrase(start, end, duration),
-                "source": "whisperx",
+                "source": "whisperx-postprocess",
             }
         )
         buffer.clear()
@@ -160,17 +169,55 @@ def words_to_phrases(words: list[dict[str, Any]], duration: float) -> list[dict[
     return phrases
 
 
-def whisperx_transcribe(audio_path: Path) -> dict[str, Any] | None:
+def words_to_raw_phrases(words: list[dict[str, Any]], duration: float) -> list[dict[str, Any]]:
+    phrases: list[dict[str, Any]] = []
+    for word in words:
+        if "start" not in word or "end" not in word:
+            continue
+        text = str(word.get("word") or word.get("text") or "").strip()
+        if not text:
+            continue
+        start = float(word["start"])
+        end = float(word["end"])
+        phrases.append(
+            {
+                "id": new_id("phr"),
+                "text": text,
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "kind": "clip",
+                "quality": quality_for_phrase(start, end, duration),
+                "source": "whisperx-word",
+            }
+        )
+    return phrases
+
+
+def whisperx_transcribe(
+    audio_path: Path,
+    whisper_model: str | None = None,
+    whisper_prompt: str | None = None,
+    enable_text_postprocess: bool = False,
+) -> dict[str, Any] | None:
     try:
         import torch
         import whisperx
     except Exception:
         return None
 
+    model_name = (whisper_model or "").strip() or "medium"
+    prompt = (whisper_prompt or "").strip() or DEFAULT_WHISPER_PROMPT
+
     try:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         compute_type = "float16" if device == "cuda" else "int8"
-        model = whisperx.load_model("medium", device, language="zh", compute_type=compute_type)
+        model = whisperx.load_model(
+            model_name,
+            device,
+            language="zh",
+            compute_type=compute_type,
+            asr_options={"initial_prompt": prompt},
+        )
         result = model.transcribe(str(audio_path), batch_size=4, language="zh")
         model_a, metadata = whisperx.load_align_model(language_code="zh", device=device)
         aligned = whisperx.align(result["segments"], model_a, metadata, str(audio_path), device)
@@ -193,9 +240,13 @@ def whisperx_transcribe(audio_path: Path) -> dict[str, Any] | None:
             "duration": round(duration, 3),
             "segments": aligned.get("segments", []),
             "words": words,
-            "phrases": words_to_phrases(words, duration),
+            "phrases": words_to_phrases(words, duration) if enable_text_postprocess else words_to_raw_phrases(words, duration),
             "engine": "whisperx",
-            "engineNote": f"WhisperX on {device}, compute_type={compute_type}",
+            "engineNote": f"WhisperX {model_name} on {device}, compute_type={compute_type}",
+            "whisperModel": model_name,
+            "whisperPrompt": prompt,
+            "enableTextPostprocess": enable_text_postprocess,
+            "textPostprocessMode": "postprocess" if enable_text_postprocess else "raw",
         }
     except Exception as exc:
         duration = None
@@ -211,16 +262,29 @@ def whisperx_transcribe(audio_path: Path) -> dict[str, Any] | None:
             "phrases": [],
             "engine": "whisperx-error",
             "engineNote": f"WhisperX 转写失败，已退回手工文本/文件名模式：{type(exc).__name__}: {exc}",
+            "whisperModel": model_name,
+            "whisperPrompt": prompt,
+            "enableTextPostprocess": enable_text_postprocess,
+            "textPostprocessMode": "error",
         }
 
 
-def transcribe(audio_path: Path, manual_text: str | None, prefer_whisperx: bool) -> dict[str, Any]:
+def transcribe(
+    audio_path: Path,
+    manual_text: str | None,
+    prefer_whisperx: bool,
+    whisper_model: str | None = None,
+    whisper_prompt: str | None = None,
+    enable_text_postprocess: bool = False,
+) -> dict[str, Any]:
     if prefer_whisperx:
-        result = whisperx_transcribe(audio_path)
+        result = whisperx_transcribe(audio_path, whisper_model, whisper_prompt, enable_text_postprocess)
         if result and result.get("phrases"):
             return result
-        fallback = fallback_transcribe(audio_path, manual_text)
+        fallback = fallback_transcribe(audio_path, manual_text, whisper_model, enable_text_postprocess)
         if result and result.get("engineNote"):
             fallback["engineNote"] = result["engineNote"]
+        if result and result.get("engine"):
+            fallback["engine"] = result["engine"]
         return fallback
-    return fallback_transcribe(audio_path, manual_text)
+    return fallback_transcribe(audio_path, manual_text, whisper_model, enable_text_postprocess)

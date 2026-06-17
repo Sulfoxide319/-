@@ -15,6 +15,7 @@ from .audio_render import render_track
 from .storage import (
     RECORDINGS_DIR,
     RENDERS_DIR,
+    clear_generated_data,
     ensure_dirs,
     list_recordings,
     new_id,
@@ -49,6 +50,7 @@ class PhrasePatch(BaseModel):
 
 class RenderRequest(BaseModel):
     items: list[dict[str, Any]]
+    settings: dict[str, Any] | None = None
 
 
 def normalize_upload_to_wav(source_path: Path, wav_path: Path) -> float:
@@ -99,11 +101,19 @@ def recordings() -> list[dict[str, Any]]:
     return list_recordings()
 
 
+@app.delete("/api/data")
+def clear_data() -> dict[str, Any]:
+    return {"ok": True, "deleted": clear_generated_data()}
+
+
 @app.post("/api/recordings")
 async def upload_recording(
     file: UploadFile = File(...),
     manualText: str | None = Form(default=None),
     autoTranscribe: bool = Form(default=False),
+    whisperModel: str | None = Form(default=None),
+    whisperPrompt: str | None = Form(default=None),
+    enableTextPostprocess: bool = Form(default=False),
 ) -> dict[str, Any]:
     ensure_dirs()
     recording_id = new_id("rec")
@@ -114,7 +124,14 @@ async def upload_recording(
         shutil.copyfileobj(file.file, handle)
     normalize_upload_to_wav(raw_path, audio_path)
 
-    result = transcribe(audio_path, manualText, prefer_whisperx=autoTranscribe)
+    result = transcribe(
+        audio_path,
+        manualText,
+        prefer_whisperx=autoTranscribe,
+        whisper_model=whisperModel,
+        whisper_prompt=whisperPrompt,
+        enable_text_postprocess=enableTextPostprocess,
+    )
     meta = {
         "id": recording_id,
         "name": file.filename or recording_id,
@@ -127,12 +144,26 @@ async def upload_recording(
 
 
 @app.post("/api/recordings/{recording_id}/transcribe")
-def transcribe_recording(recording_id: str, manualText: str | None = Form(default=None), autoTranscribe: bool = Form(default=True)) -> dict[str, Any]:
+def transcribe_recording(
+    recording_id: str,
+    manualText: str | None = Form(default=None),
+    autoTranscribe: bool = Form(default=True),
+    whisperModel: str | None = Form(default=None),
+    whisperPrompt: str | None = Form(default=None),
+    enableTextPostprocess: bool = Form(default=False),
+) -> dict[str, Any]:
     meta_path = recording_meta_path(recording_id)
     meta = read_json(meta_path, None)
     if not meta:
         raise HTTPException(status_code=404, detail="录音不存在")
-    result = transcribe(Path(meta["audioPath"]), manualText, prefer_whisperx=autoTranscribe)
+    result = transcribe(
+        Path(meta["audioPath"]),
+        manualText,
+        prefer_whisperx=autoTranscribe,
+        whisper_model=whisperModel,
+        whisper_prompt=whisperPrompt,
+        enable_text_postprocess=enableTextPostprocess,
+    )
     meta.update(result)
     write_json(meta_path, meta)
     return meta
@@ -160,7 +191,7 @@ def patch_phrase(recording_id: str, phrase_id: str, patch: PhrasePatch) -> dict[
 @app.post("/api/render")
 def render(request: RenderRequest) -> dict[str, Any]:
     try:
-        return render_track(request.items)
+        return render_track(request.items, request.settings)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

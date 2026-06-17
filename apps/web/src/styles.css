@@ -57,7 +57,8 @@ button.danger {
 }
 
 input,
-textarea {
+textarea,
+select {
   border: 1px solid #cbd5cf;
   border-radius: 6px;
   color: #16201d;
@@ -179,6 +180,49 @@ audio {
   padding: 14px;
 }
 
+.settings-panel {
+  margin: 14px 14px 0;
+}
+
+.settings-head {
+  align-items: stretch;
+}
+
+.settings-grid,
+.advanced-settings {
+  align-items: end;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  width: min(100%, 980px);
+}
+
+.settings-grid label,
+.advanced-settings label {
+  color: #52635b;
+  display: grid;
+  font-size: 13px;
+  gap: 6px;
+}
+
+.settings-grid .toggle,
+.advanced-settings .toggle {
+  align-self: end;
+  color: #16201d;
+  display: inline-flex;
+  font-size: 14px;
+}
+
+.settings-grid .wide {
+  grid-column: span 2;
+}
+
+.advanced-settings {
+  border-top: 1px solid #edf1ee;
+  padding: 14px 16px;
+  width: 100%;
+}
+
 .panel {
   background: #ffffff;
   border: 1px solid #d9e0dc;
@@ -238,6 +282,23 @@ audio {
   color: #356354;
   font-size: 12px;
   padding: 4px 8px;
+}
+
+.recording-tools {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  margin-top: 10px;
+}
+
+.recording-tools small {
+  color: #66746f;
+}
+
+.recording-tools button {
+  min-height: 30px;
+  padding: 5px 9px;
 }
 
 .transcript {
@@ -388,9 +449,19 @@ audio {
   }
 
   .panel-head,
-  .output-head {
+  .output-head,
+  .settings-head {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .settings-grid,
+  .advanced-settings {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-grid .wide {
+    grid-column: span 1;
   }
 
   .recording-title {

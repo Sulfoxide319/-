@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from pydub import AudioSegment, effects
@@ -8,25 +7,56 @@ from pydub import AudioSegment, effects
 from .storage import RENDERS_DIR, list_recordings, new_id
 
 
+DEFAULT_RENDER_SETTINGS: dict[str, Any] = {
+    "enableAudioPostprocess": False,
+    "marginMs": 0,
+    "enableGainNormalize": False,
+    "targetDbfs": -18,
+    "maxGainDb": 8,
+    "enableClipFade": False,
+    "fadeMs": 0,
+    "enableCrossfade": False,
+    "crossfadeMs": 0,
+    "enableFinalNormalize": False,
+}
+
+
 def _safe_ms(seconds: float) -> int:
     return max(0, int(round(seconds * 1000)))
 
 
-def _clip_quality(segment: AudioSegment) -> AudioSegment:
+def _settings(settings: dict[str, Any] | None) -> dict[str, Any]:
+    return {**DEFAULT_RENDER_SETTINGS, **(settings or {})}
+
+
+def _format_segment(segment: AudioSegment) -> AudioSegment:
+    return segment.set_channels(1).set_frame_rate(44100)
+
+
+def _postprocess_clip(segment: AudioSegment, settings: dict[str, Any]) -> AudioSegment:
+    segment = _format_segment(segment)
     if len(segment) == 0:
         return segment
-    segment = segment.set_channels(1).set_frame_rate(44100)
-    if segment.dBFS != float("-inf"):
-        target = -18.0
-        segment = segment.apply_gain(max(-8.0, min(8.0, target - segment.dBFS)))
-    fade = min(8, max(3, len(segment) // 16))
-    return segment.fade_in(fade).fade_out(fade)
+
+    if settings["enableGainNormalize"] and segment.dBFS != float("-inf"):
+        target = float(settings["targetDbfs"])
+        max_gain = abs(float(settings["maxGainDb"]))
+        segment = segment.apply_gain(max(-max_gain, min(max_gain, target - segment.dBFS)))
+
+    if settings["enableClipFade"]:
+        fade_ms = max(0, int(settings["fadeMs"]))
+        if fade_ms:
+            fade_ms = min(fade_ms, len(segment) // 2)
+            segment = segment.fade_in(fade_ms).fade_out(fade_ms)
+
+    return segment
 
 
-def render_track(items: list[dict[str, Any]]) -> dict[str, Any]:
+def render_track(items: list[dict[str, Any]], settings: dict[str, Any] | None = None) -> dict[str, Any]:
+    render_settings = _settings(settings)
+    enable_postprocess = bool(render_settings["enableAudioPostprocess"])
     recordings = {recording["id"]: recording for recording in list_recordings()}
     output = AudioSegment.silent(duration=0, frame_rate=44100).set_channels(1)
-    default_crossfade_ms = 0
 
     for item in items:
         if item.get("type") == "pause":
@@ -48,22 +78,32 @@ def render_track(items: list[dict[str, Any]]) -> dict[str, Any]:
             continue
 
         audio = AudioSegment.from_file(recording["audioPath"])
-        margin_ms = int(item.get("marginMs") or 12)
+        margin_ms = int(render_settings["marginMs"]) if enable_postprocess else 0
         start_ms = max(0, _safe_ms(float(phrase["start"])) - margin_ms)
         end_ms = min(len(audio), _safe_ms(float(phrase["end"])) + margin_ms)
-        segment = _clip_quality(audio[start_ms:end_ms])
-        crossfade_ms = max(0, min(8, int(item.get("crossfadeMs") or default_crossfade_ms)))
-        if len(output) and crossfade_ms and len(segment) > crossfade_ms and len(output) > crossfade_ms:
+        segment = audio[start_ms:end_ms]
+        segment = _postprocess_clip(segment, render_settings) if enable_postprocess else _format_segment(segment)
+
+        crossfade_ms = 0
+        if enable_postprocess and render_settings["enableCrossfade"]:
+            crossfade_ms = max(0, int(render_settings["crossfadeMs"]))
+            crossfade_ms = min(crossfade_ms, len(segment) // 2, len(output) // 2)
+
+        if crossfade_ms:
             output = output.append(segment, crossfade=crossfade_ms)
         else:
             output += segment
+
         pause_after_ms = int(item.get("pauseAfterMs") or phrase.get("pauseAfterMs") or 0)
         if pause_after_ms > 0:
             output += AudioSegment.silent(duration=min(1200, pause_after_ms), frame_rate=44100).set_channels(1)
 
     if len(output) == 0:
         output = AudioSegment.silent(duration=300, frame_rate=44100).set_channels(1)
-    output = effects.normalize(output, headroom=1.0)
+
+    if enable_postprocess and render_settings["enableFinalNormalize"]:
+        output = effects.normalize(output, headroom=1.0)
+
     render_id = new_id("render")
     wav_path = RENDERS_DIR / f"{render_id}.wav"
     mp3_path = RENDERS_DIR / f"{render_id}.mp3"
@@ -74,4 +114,5 @@ def render_track(items: list[dict[str, Any]]) -> dict[str, Any]:
         "durationMs": len(output),
         "wavUrl": f"/api/renders/{render_id}.wav",
         "mp3Url": f"/api/renders/{render_id}.mp3",
+        "settingsUsed": render_settings,
     }

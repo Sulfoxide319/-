@@ -18,6 +18,21 @@ def ensure_dirs() -> None:
         path.mkdir(parents=True, exist_ok=True)
 
 
+def clear_generated_data() -> dict[str, int]:
+    ensure_dirs()
+    deleted = {"recordings": 0, "transcriptions": 0, "renders": 0}
+    for name, directory in (
+        ("recordings", RECORDINGS_DIR),
+        ("transcriptions", TRANSCRIPTIONS_DIR),
+        ("renders", RENDERS_DIR),
+    ):
+        for path in directory.iterdir():
+            if path.is_file() and path.name != ".gitkeep":
+                path.unlink()
+                deleted[name] += 1
+    return deleted
+
+
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:10]}"
 
@@ -43,4 +58,3 @@ def list_recordings() -> list[dict[str, Any]]:
     for path in sorted(TRANSCRIPTIONS_DIR.glob("rec_*.json")):
         recordings.append(read_json(path, {}))
     return recordings
-
