@@ -52,6 +52,29 @@ def _postprocess_clip(segment: AudioSegment, settings: dict[str, Any]) -> AudioS
     return segment
 
 
+def _phrase_ranges_ms(phrase: dict[str, Any], audio_length_ms: int, margin_ms: int) -> list[tuple[int, int]]:
+    raw_segments = phrase.get("segments")
+    if isinstance(raw_segments, list) and raw_segments:
+        ranges = []
+        for segment in raw_segments:
+            if not isinstance(segment, dict):
+                continue
+            start = segment.get("start")
+            end = segment.get("end")
+            if start is None or end is None:
+                continue
+            start_ms = max(0, _safe_ms(float(start)) - margin_ms)
+            end_ms = min(audio_length_ms, _safe_ms(float(end)) + margin_ms)
+            if end_ms > start_ms:
+                ranges.append((start_ms, end_ms))
+        if ranges:
+            return ranges
+
+    start_ms = max(0, _safe_ms(float(phrase["start"])) - margin_ms)
+    end_ms = min(audio_length_ms, _safe_ms(float(phrase["end"])) + margin_ms)
+    return [(start_ms, end_ms)] if end_ms > start_ms else []
+
+
 def render_track(items: list[dict[str, Any]], settings: dict[str, Any] | None = None) -> dict[str, Any]:
     render_settings = _settings(settings)
     enable_postprocess = bool(render_settings["enableAudioPostprocess"])
@@ -74,14 +97,16 @@ def render_track(items: list[dict[str, Any]], settings: dict[str, Any] | None = 
         if not phrase:
             raise ValueError(f"找不到短语：{phrase_id}")
         if phrase.get("kind") == "pause":
-            output += AudioSegment.silent(duration=260, frame_rate=44100).set_channels(1)
+            duration = int(item.get("durationMs") or phrase.get("pauseAfterMs") or 260)
+            output += AudioSegment.silent(duration=max(40, duration), frame_rate=44100).set_channels(1)
             continue
 
         audio = AudioSegment.from_file(recording["audioPath"])
         margin_ms = int(render_settings["marginMs"]) if enable_postprocess else 0
-        start_ms = max(0, _safe_ms(float(phrase["start"])) - margin_ms)
-        end_ms = min(len(audio), _safe_ms(float(phrase["end"])) + margin_ms)
-        segment = audio[start_ms:end_ms]
+        ranges = _phrase_ranges_ms(phrase, len(audio), margin_ms)
+        segment = AudioSegment.silent(duration=0, frame_rate=audio.frame_rate)
+        for start_ms, end_ms in ranges:
+            segment += audio[start_ms:end_ms]
         segment = _postprocess_clip(segment, render_settings) if enable_postprocess else _format_segment(segment)
 
         crossfade_ms = 0

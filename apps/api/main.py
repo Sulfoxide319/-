@@ -114,6 +114,8 @@ async def upload_recording(
     whisperModel: str | None = Form(default=None),
     whisperPrompt: str | None = Form(default=None),
     enableTextPostprocess: bool = Form(default=False),
+    enableBoundaryRefine: bool = Form(default=False),
+    enablePhraseMerge: bool = Form(default=False),
 ) -> dict[str, Any]:
     ensure_dirs()
     recording_id = new_id("rec")
@@ -131,6 +133,8 @@ async def upload_recording(
         whisper_model=whisperModel,
         whisper_prompt=whisperPrompt,
         enable_text_postprocess=enableTextPostprocess,
+        enable_boundary_refine=enableBoundaryRefine,
+        enable_phrase_merge=enablePhraseMerge,
     )
     meta = {
         "id": recording_id,
@@ -151,6 +155,8 @@ def transcribe_recording(
     whisperModel: str | None = Form(default=None),
     whisperPrompt: str | None = Form(default=None),
     enableTextPostprocess: bool = Form(default=False),
+    enableBoundaryRefine: bool = Form(default=False),
+    enablePhraseMerge: bool = Form(default=False),
 ) -> dict[str, Any]:
     meta_path = recording_meta_path(recording_id)
     meta = read_json(meta_path, None)
@@ -163,6 +169,8 @@ def transcribe_recording(
         whisper_model=whisperModel,
         whisper_prompt=whisperPrompt,
         enable_text_postprocess=enableTextPostprocess,
+        enable_boundary_refine=enableBoundaryRefine,
+        enable_phrase_merge=enablePhraseMerge,
     )
     meta.update(result)
     write_json(meta_path, meta)
@@ -179,10 +187,14 @@ def patch_phrase(recording_id: str, phrase_id: str, patch: PhrasePatch) -> dict[
         if phrase.get("id") == phrase_id:
             if patch.text is not None:
                 phrase["text"] = patch.text
+            boundary_changed = patch.start is not None or patch.end is not None
             if patch.start is not None:
                 phrase["start"] = max(0, round(patch.start, 3))
             if patch.end is not None:
                 phrase["end"] = max(0, round(patch.end, 3))
+            if boundary_changed:
+                phrase["segments"] = [{"start": phrase["start"], "end": phrase["end"]}]
+                phrase.pop("removedGaps", None)
             write_json(meta_path, meta)
             return phrase
     raise HTTPException(status_code=404, detail="短语不存在")

@@ -1,18 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import {
-  Download,
-  FileAudio,
-  Mic,
-  Pause,
-  Play,
-  Plus,
-  RefreshCw,
-  Scissors,
-  Trash2,
-  Upload,
-  Wand2,
-} from "lucide-react";
+import { Download, FileAudio, Mic, Pause, Play, Plus, RefreshCw, Scissors, Trash2, Upload, Wand2 } from "lucide-react";
 import "./styles.css";
 
 const API = "";
@@ -23,6 +11,20 @@ type Phrase = {
   text: string;
   start: number;
   end: number;
+  segments?: Array<{ start: number; end: number }>;
+  removedGaps?: Array<{ start: number; end: number; reason?: string }>;
+  boundaryCuts?: Array<{ at: number; with?: string; reason?: string }>;
+  anchor?: { start: number; end: number; source?: string };
+  scores?: {
+    noiseFloorDb?: number;
+    speechPeakDb?: number;
+    onsetThresholdDb?: number;
+    releaseThresholdDb?: number;
+    vadSource?: string;
+    vadAvailable?: boolean;
+  };
+  ownership?: string;
+  pauseAfterMs?: number;
   kind: "clip" | "pause";
   quality: "good" | "warn" | "bad";
   source?: string;
@@ -39,7 +41,8 @@ type Recording = {
   engine: string;
   engineNote?: string;
   whisperModel?: string;
-  enableTextPostprocess?: boolean;
+  enableBoundaryRefine?: boolean;
+  enablePhraseMerge?: boolean;
   textPostprocessMode?: string;
 };
 
@@ -72,14 +75,7 @@ const DEFAULT_RENDER_SETTINGS: RenderSettings = {
 };
 
 type TrackItem =
-  | {
-      id: string;
-      type: "clip";
-      recordingId: string;
-      phraseId: string;
-      text: string;
-      recordingName: string;
-    }
+  | { id: string; type: "clip"; recordingId: string; phraseId: string; text: string; recordingName: string }
   | { id: string; type: "pause"; durationMs: number; text: string };
 
 type Health = {
@@ -91,6 +87,13 @@ type Health = {
 
 function newItemId() {
   return `item_${Math.random().toString(16).slice(2)}_${Date.now()}`;
+}
+
+function phraseSegments(phrase: Phrase) {
+  if (phrase.segments?.length) {
+    return phrase.segments.filter((segment) => Number.isFinite(segment.start) && Number.isFinite(segment.end) && segment.end > segment.start);
+  }
+  return [{ start: phrase.start, end: phrase.end }];
 }
 
 async function responseMessage(res: Response) {
@@ -112,18 +115,14 @@ function App() {
   const [whisperModelPreset, setWhisperModelPreset] = useState<WhisperModelPreset>("medium");
   const [customWhisperModel, setCustomWhisperModel] = useState("");
   const [whisperPrompt, setWhisperPrompt] = useState(DEFAULT_WHISPER_PROMPT);
-  const [enableTextPostprocess, setEnableTextPostprocess] = useState(false);
-  const [renderSettings, setRenderSettings] = useState<RenderSettings>(DEFAULT_RENDER_SETTINGS);
+  const [enableBoundaryRefine, setEnableBoundaryRefine] = useState(false);
+  const [enablePhraseMerge, setEnablePhraseMerge] = useState(false);
+  const [renderSettings] = useState<RenderSettings>(DEFAULT_RENDER_SETTINGS);
   const [health, setHealth] = useState<Health | null>(null);
   const [busy, setBusy] = useState("");
   const [message, setMessage] = useState("");
   const [selected, setSelected] = useState<{ recordingId: string; phrase: Phrase } | null>(null);
-  const [renderResult, setRenderResult] = useState<{
-    wavUrl: string;
-    mp3Url: string;
-    durationMs: number;
-    settingsUsed?: RenderSettings;
-  } | null>(null);
+  const [renderResult, setRenderResult] = useState<{ wavUrl: string; mp3Url: string; durationMs: number } | null>(null);
   const [recordingNow, setRecordingNow] = useState(false);
   const [micLevel, setMicLevel] = useState(0);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -168,21 +167,20 @@ function App() {
     form.append("autoTranscribe", String(autoTranscribe));
     form.append("whisperModel", selectedWhisperModel());
     form.append("whisperPrompt", whisperPrompt.trim() || DEFAULT_WHISPER_PROMPT);
-    form.append("enableTextPostprocess", String(enableTextPostprocess));
-  }
-
-  function updateRenderSettings(patch: Partial<RenderSettings>) {
-    setRenderSettings((prev) => ({ ...prev, ...patch }));
+    form.append("enableTextPostprocess", "false");
+    form.append("enableBoundaryRefine", String(enableBoundaryRefine));
+    form.append("enablePhraseMerge", String(enablePhraseMerge));
   }
 
   function phraseMode(recording: Recording) {
     const sources = new Set(recording.phrases.map((phrase) => phrase.source || "unknown"));
     if (recording.textPostprocessMode) return recording.textPostprocessMode;
+    if (sources.has("phrase-merged")) return "phrase-merged";
+    if (sources.has("boundary-refined")) return "boundary-refined";
     if (sources.has("whisperx-word")) return "raw";
-    if (sources.has("whisperx-postprocess")) return "postprocess";
-    if (sources.has("whisperx")) return "legacy-postprocess";
+    if (sources.has("whisperx-postprocess") || sources.has("whisperx")) return "legacy-postprocess";
     if (sources.has("fallback")) return "fallback";
-    return recording.enableTextPostprocess ? "postprocess" : "unknown";
+    return "unknown";
   }
 
   function sourceSummary(recording: Recording) {
@@ -191,9 +189,15 @@ function App() {
       acc[source] = (acc[source] || 0) + 1;
       return acc;
     }, {});
-    return Object.entries(counts)
-      .map(([source, count]) => `${source}:${count}`)
-      .join(" / ");
+    return Object.entries(counts).map(([source, count]) => `${source}:${count}`).join(" / ");
+  }
+
+  function busyText() {
+    if (busy === "upload") return "正在上传并转写...";
+    if (busy === "transcribe") return "正在重新转写...";
+    if (busy === "render") return "正在生成音频...";
+    if (busy === "clear") return "正在清理数据...";
+    return "正在处理...";
   }
 
   async function uploadFile(file: File) {
@@ -239,8 +243,7 @@ function App() {
     recorder.onstop = async () => {
       stream.getTracks().forEach((track) => track.stop());
       const blob = new Blob(chunksRef.current, { type: "audio/webm" });
-      const file = new File([blob], `browser-recording-${Date.now()}.webm`, { type: "audio/webm" });
-      await uploadFile(file);
+      await uploadFile(new File([blob], `browser-recording-${Date.now()}.webm`, { type: "audio/webm" }));
     };
     recorderRef.current = recorder;
     recorder.start();
@@ -258,7 +261,6 @@ function App() {
     const audioWindow = window as typeof window & { webkitAudioContext?: typeof AudioContext };
     const AudioContextClass = audioWindow.AudioContext || audioWindow.webkitAudioContext;
     if (!AudioContextClass) return;
-
     const audioContext = new AudioContextClass();
     const analyser = audioContext.createAnalyser();
     analyser.fftSize = 1024;
@@ -266,7 +268,6 @@ function App() {
     audioContext.createMediaStreamSource(stream).connect(analyser);
     const samples = new Uint8Array(analyser.fftSize);
     audioContextRef.current = audioContext;
-
     const update = () => {
       analyser.getByteTimeDomainData(samples);
       let sum = 0;
@@ -274,70 +275,54 @@ function App() {
         const centered = (sample - 128) / 128;
         sum += centered * centered;
       }
-      const rms = Math.sqrt(sum / samples.length);
-      setMicLevel(Math.min(1, rms * 4));
+      setMicLevel(Math.min(1, Math.sqrt(sum / samples.length) * 4));
       levelFrameRef.current = window.requestAnimationFrame(update);
     };
     update();
   }
 
   function stopLevelMeter() {
-    if (levelFrameRef.current !== null) {
-      window.cancelAnimationFrame(levelFrameRef.current);
-      levelFrameRef.current = null;
-    }
-    if (audioContextRef.current) {
-      void audioContextRef.current.close();
-      audioContextRef.current = null;
-    }
+    if (levelFrameRef.current !== null) window.cancelAnimationFrame(levelFrameRef.current);
+    levelFrameRef.current = null;
+    if (audioContextRef.current) void audioContextRef.current.close();
+    audioContextRef.current = null;
     setMicLevel(0);
   }
 
+  function dragPayload(recording: Recording, phrase: Phrase) {
+    return JSON.stringify({ type: "clip", recordingId: recording.id, phraseId: phrase.id, text: phrase.text, recordingName: recording.name });
+  }
+
   function onPhraseDrag(event: React.DragEvent, recording: Recording, phrase: Phrase) {
-    event.dataTransfer.setData(
-      "application/json",
-      JSON.stringify({
-        type: "clip",
-        recordingId: recording.id,
-        phraseId: phrase.id,
-        text: phrase.text,
-        recordingName: recording.name,
-      })
-    );
+    event.dataTransfer.setData("application/json", dragPayload(recording, phrase));
+  }
+
+  function insertOutputItem(data: Record<string, unknown>, index: number) {
+    setOutputItems((prev) => {
+      const next = [...prev];
+      if (typeof data.reorderId === "string") {
+        const from = next.findIndex((item) => item.id === data.reorderId);
+        if (from < 0) return prev;
+        const [moved] = next.splice(from, 1);
+        next.splice(Math.max(0, Math.min(next.length, from < index ? index - 1 : index)), 0, moved);
+        return next;
+      }
+      next.splice(Math.max(0, Math.min(next.length, index)), 0, { id: newItemId(), ...data } as TrackItem);
+      return next;
+    });
   }
 
   function onOutputDrop(event: React.DragEvent) {
     event.preventDefault();
     const raw = event.dataTransfer.getData("application/json");
-    if (!raw) return;
-    const data = JSON.parse(raw);
-    if (data.reorderId) {
-      const from = outputItems.findIndex((item) => item.id === data.reorderId);
-      if (from < 0) return;
-      const next = [...outputItems];
-      const [moved] = next.splice(from, 1);
-      next.push(moved);
-      setOutputItems(next);
-      return;
-    }
-    setOutputItems((prev) => [...prev, { id: newItemId(), ...data }]);
+    if (raw) insertOutputItem(JSON.parse(raw), outputItems.length);
   }
 
-  function reorderDrop(event: React.DragEvent, targetId: string) {
+  function outputInsertDrop(event: React.DragEvent, index: number) {
     event.preventDefault();
+    event.stopPropagation();
     const raw = event.dataTransfer.getData("application/json");
-    if (!raw) return;
-    const data = JSON.parse(raw);
-    if (!data.reorderId) return;
-    setOutputItems((prev) => {
-      const from = prev.findIndex((item) => item.id === data.reorderId);
-      const to = prev.findIndex((item) => item.id === targetId);
-      if (from < 0 || to < 0 || from === to) return prev;
-      const next = [...prev];
-      const [moved] = next.splice(from, 1);
-      next.splice(to, 0, moved);
-      return next;
-    });
+    if (raw) insertOutputItem(JSON.parse(raw), index);
   }
 
   function insertPause(durationMs = 260) {
@@ -346,20 +331,12 @@ function App() {
 
   async function render() {
     setBusy("render");
-    setMessage("正在拼接和后处理...");
+    setMessage("正在拼接...");
     const payload = {
-      items: outputItems.map((item) =>
-        item.type === "pause"
-          ? { type: "pause", durationMs: item.durationMs }
-          : { type: "clip", recordingId: item.recordingId, phraseId: item.phraseId }
-      ),
+      items: outputItems.map((item) => (item.type === "pause" ? { type: "pause", durationMs: item.durationMs } : { type: "clip", recordingId: item.recordingId, phraseId: item.phraseId })),
       settings: renderSettings,
     };
-    const res = await fetch(`${API}/api/render`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+    const res = await fetch(`${API}/api/render`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
     if (!res.ok) {
       setMessage(await responseMessage(res));
     } else {
@@ -379,12 +356,7 @@ function App() {
     const updated = await res.json();
     setRecordings((prev) =>
       prev.map((recording) =>
-        recording.id === recordingId
-          ? {
-              ...recording,
-              phrases: recording.phrases.map((item) => (item.id === phrase.id ? updated : item)),
-            }
-          : recording
+        recording.id === recordingId ? { ...recording, phrases: recording.phrases.map((item) => (item.id === phrase.id ? updated : item)) } : recording
       )
     );
     setSelected({ recordingId, phrase: updated });
@@ -428,11 +400,20 @@ function App() {
         </div>
       </header>
 
+      {busy && (
+        <div className="processing">
+          <span>{busyText()}</span>
+          <div className="processing-track" aria-label={busyText()}>
+            <div className="processing-bar" />
+          </div>
+        </div>
+      )}
+
       <section className="panel settings-panel">
         <div className="panel-head settings-head">
           <div>
             <h2>测试配置</h2>
-            <p>默认保留 WhisperX 原始切分和原始音频包络。</p>
+            <p>默认保留 WhisperX 原始切分；需要优化时显式打开边界优化和连词合并。</p>
           </div>
           <div className="settings-grid">
             <label className="toggle">
@@ -456,98 +437,18 @@ function App() {
             )}
             <label className="wide">
               WhisperX initial prompt
-              <input
-                value={whisperPrompt}
-                onChange={(event) => setWhisperPrompt(event.target.value)}
-                placeholder={DEFAULT_WHISPER_PROMPT}
-              />
+              <input value={whisperPrompt} onChange={(event) => setWhisperPrompt(event.target.value)} placeholder={DEFAULT_WHISPER_PROMPT} />
             </label>
             <label className="toggle">
-              <input
-                type="checkbox"
-                checked={enableTextPostprocess}
-                onChange={(event) => setEnableTextPostprocess(event.target.checked)}
-              />
-              <span>文本后处理</span>
+              <input type="checkbox" checked={enableBoundaryRefine} onChange={(event) => setEnableBoundaryRefine(event.target.checked)} />
+              <span>边界优化</span>
             </label>
             <label className="toggle">
-              <input
-                type="checkbox"
-                checked={renderSettings.enableAudioPostprocess}
-                onChange={(event) => updateRenderSettings({ enableAudioPostprocess: event.target.checked })}
-              />
-              <span>音频后处理</span>
+              <input type="checkbox" checked={enablePhraseMerge} onChange={(event) => setEnablePhraseMerge(event.target.checked)} />
+              <span>连词合并</span>
             </label>
           </div>
         </div>
-        {renderSettings.enableAudioPostprocess && (
-          <div className="advanced-settings">
-            <label>
-              marginMs
-              <input
-                type="number"
-                value={renderSettings.marginMs}
-                onChange={(event) => updateRenderSettings({ marginMs: Number(event.target.value) })}
-              />
-            </label>
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={renderSettings.enableGainNormalize}
-                onChange={(event) => updateRenderSettings({ enableGainNormalize: event.target.checked })}
-              />
-              <span>增益归一</span>
-            </label>
-            <label>
-              targetDbfs
-              <input
-                type="number"
-                value={renderSettings.targetDbfs}
-                onChange={(event) => updateRenderSettings({ targetDbfs: Number(event.target.value) })}
-              />
-            </label>
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={renderSettings.enableClipFade}
-                onChange={(event) => updateRenderSettings({ enableClipFade: event.target.checked })}
-              />
-              <span>片段 fade</span>
-            </label>
-            <label>
-              fadeMs
-              <input
-                type="number"
-                value={renderSettings.fadeMs}
-                onChange={(event) => updateRenderSettings({ fadeMs: Number(event.target.value) })}
-              />
-            </label>
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={renderSettings.enableCrossfade}
-                onChange={(event) => updateRenderSettings({ enableCrossfade: event.target.checked })}
-              />
-              <span>连接 crossfade</span>
-            </label>
-            <label>
-              crossfadeMs
-              <input
-                type="number"
-                value={renderSettings.crossfadeMs}
-                onChange={(event) => updateRenderSettings({ crossfadeMs: Number(event.target.value) })}
-              />
-            </label>
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={renderSettings.enableFinalNormalize}
-                onChange={(event) => updateRenderSettings({ enableFinalNormalize: event.target.checked })}
-              />
-              <span>最终 normalize</span>
-            </label>
-          </div>
-        )}
       </section>
 
       <main className="workspace">
@@ -557,11 +458,7 @@ function App() {
               <h2>录音轨</h2>
               <p>上传前可填转写文本；未启用 WhisperX 时按文本均分短语。</p>
             </div>
-            <textarea
-              value={manualText}
-              onChange={(event) => setManualText(event.target.value)}
-              placeholder="可选：输入这段录音的文字，例如：我是张三，他是李四"
-            />
+            <textarea value={manualText} onChange={(event) => setManualText(event.target.value)} placeholder="可选：输入这段录音的文字，例如：我是张三，他是李四" />
           </div>
           <div className="recording-list">
             {recordings.map((recording) => (
@@ -585,11 +482,12 @@ function App() {
                     重新转写
                   </button>
                 </div>
+                <RecordingWaveform recording={recording} onSelect={(phrase) => setSelected({ recordingId: recording.id, phrase })} />
                 <div className="transcript">{recording.text}</div>
                 <div className="phrases">
                   {recording.phrases.map((phrase) =>
                     phrase.kind === "pause" ? (
-                      <button className="phrase pause" key={phrase.id} onClick={() => insertPause(260)}>
+                      <button className="phrase pause" key={phrase.id} onClick={() => insertPause(phrase.pauseAfterMs ?? 260)}>
                         {phrase.text}
                       </button>
                     ) : (
@@ -638,24 +536,22 @@ function App() {
             </div>
           </div>
           <div className="dropzone" onDragOver={(event) => event.preventDefault()} onDrop={onOutputDrop}>
-            {outputItems.map((item) => (
-              <div
-                className={`output-item ${item.type}`}
-                key={item.id}
-                draggable
-                onDragStart={(event) => event.dataTransfer.setData("application/json", JSON.stringify({ reorderId: item.id }))}
-                onDragOver={(event) => event.preventDefault()}
-                onDrop={(event) => reorderDrop(event, item.id)}
-              >
-                <span>{item.text}</span>
-                {item.type === "clip" && <small>{item.recordingName}</small>}
-                <button onClick={() => setOutputItems((prev) => prev.filter((candidate) => candidate.id !== item.id))}>
-                  <Trash2 size={14} />
-                </button>
-              </div>
+            {outputItems.map((item, index) => (
+              <React.Fragment key={item.id}>
+                <div className="insert-slot" onDragOver={(event) => event.preventDefault()} onDrop={(event) => outputInsertDrop(event, index)} title="拖到这里插入" />
+                <div className={`output-item ${item.type}`} draggable onDragStart={(event) => event.dataTransfer.setData("application/json", JSON.stringify({ reorderId: item.id }))}>
+                  <span>{item.text}</span>
+                  {item.type === "clip" && <small>{item.recordingName}</small>}
+                  <button onClick={() => setOutputItems((prev) => prev.filter((candidate) => candidate.id !== item.id))}>
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              </React.Fragment>
             ))}
+            {!!outputItems.length && <div className="insert-slot end" onDragOver={(event) => event.preventDefault()} onDrop={(event) => outputInsertDrop(event, outputItems.length)} title="拖到这里插入" />}
             {!outputItems.length && <div className="empty">输出轨为空</div>}
           </div>
+          <OutputWaveTimeline items={outputItems} recordings={recordings} onRemove={(id) => setOutputItems((prev) => prev.filter((candidate) => candidate.id !== id))} onInsertDrop={outputInsertDrop} />
           {renderResult && (
             <div className="render-result">
               <audio src={renderResult.wavUrl} controls />
@@ -689,15 +585,359 @@ function App() {
   );
 }
 
-function PhraseInspector({
-  recording,
-  phrase,
-  onPatch,
+function OutputWaveTimeline({
+  items,
+  recordings,
+  onRemove,
+  onInsertDrop,
 }: {
-  recording?: Recording;
-  phrase: Phrase;
-  onPatch: (patch: Partial<Phrase>) => Promise<void>;
+  items: TrackItem[];
+  recordings: Recording[];
+  onRemove: (id: string) => void;
+  onInsertDrop: (event: React.DragEvent, index: number) => void;
 }) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [status, setStatus] = useState("loading");
+  const [segments, setSegments] = useState<Array<{ item: TrackItem; left: number; width: number; durationMs: number }>>([]);
+  const [totalMs, setTotalMs] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    let audioContext: AudioContext | null = null;
+    let resizeObserver: ResizeObserver | null = null;
+
+    async function buildOutputWave() {
+      const canvas = canvasRef.current;
+      if (!canvas || !items.length) return;
+      setStatus("loading");
+      try {
+        const audioWindow = window as typeof window & { webkitAudioContext?: typeof AudioContext };
+        const AudioContextClass = audioWindow.AudioContext || audioWindow.webkitAudioContext;
+        if (!AudioContextClass) {
+          setStatus("unsupported");
+          return;
+        }
+        audioContext = new AudioContextClass();
+        const buffers = new Map<string, AudioBuffer>();
+        const bufferFor = async (recording: Recording) => {
+          const cached = buffers.get(recording.id);
+          if (cached) return cached;
+          const res = await fetch(recording.audioUrl);
+          const data = await res.arrayBuffer();
+          const buffer = await audioContext!.decodeAudioData(data.slice(0));
+          buffers.set(recording.id, buffer);
+          return buffer;
+        };
+
+        const sampleRate = audioContext.sampleRate;
+        const chunks: Float32Array[] = [];
+        const nextSegments: Array<{ item: TrackItem; startSample: number; sampleCount: number; durationMs: number }> = [];
+        let totalSamples = 0;
+
+        for (const item of items) {
+          let chunk = new Float32Array(0);
+          if (item.type === "pause") {
+            chunk = new Float32Array(Math.max(1, Math.round((item.durationMs / 1000) * sampleRate)));
+          } else {
+            const recording = recordings.find((candidate) => candidate.id === item.recordingId);
+            const phrase = recording?.phrases.find((candidate) => candidate.id === item.phraseId);
+            if (recording && phrase) {
+              const buffer = await bufferFor(recording);
+              const channel = buffer.getChannelData(0);
+              const slices = phraseSegments(phrase).map((segment) => {
+                const start = Math.max(0, Math.floor(segment.start * buffer.sampleRate));
+                const end = Math.min(channel.length, Math.ceil(segment.end * buffer.sampleRate));
+                return channel.slice(start, Math.max(start + 1, end));
+              });
+              const sampleCount = slices.reduce((sum, slice) => sum + slice.length, 0);
+              chunk = new Float32Array(Math.max(1, sampleCount));
+              let cursor = 0;
+              for (const slice of slices) {
+                chunk.set(slice, cursor);
+                cursor += slice.length;
+              }
+            }
+          }
+          chunks.push(chunk);
+          nextSegments.push({ item, startSample: totalSamples, sampleCount: chunk.length, durationMs: Math.round((chunk.length / sampleRate) * 1000) });
+          totalSamples += chunk.length;
+        }
+
+        const output = new Float32Array(Math.max(1, totalSamples));
+        let writeCursor = 0;
+        for (const chunk of chunks) {
+          output.set(chunk, writeCursor);
+          writeCursor += chunk.length;
+        }
+
+        const visibleSegments = nextSegments.map((segment) => ({
+          item: segment.item,
+          durationMs: segment.durationMs,
+          left: totalSamples ? (segment.startSample / totalSamples) * 100 : 0,
+          width: totalSamples ? Math.max(0.8, (segment.sampleCount / totalSamples) * 100) : 0,
+        }));
+
+        const redraw = () => {
+          if (cancelled) return;
+          const parentWidth = canvas.parentElement?.clientWidth || 720;
+          const dpr = window.devicePixelRatio || 1;
+          const width = Math.max(320, Math.floor(parentWidth));
+          const height = 118;
+          canvas.width = Math.floor(width * dpr);
+          canvas.height = Math.floor(height * dpr);
+          canvas.style.width = `${width}px`;
+          canvas.style.height = `${height}px`;
+          const ctx = canvas.getContext("2d");
+          if (!ctx) return;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          ctx.clearRect(0, 0, width, height);
+          ctx.fillStyle = "#f7faf8";
+          ctx.fillRect(0, 0, width, height);
+          ctx.strokeStyle = "#d9e0dc";
+          ctx.strokeRect(0.5, 0.5, width - 1, height - 1);
+
+          for (const segment of visibleSegments) {
+            const x = (segment.left / 100) * width;
+            const w = (segment.width / 100) * width;
+            ctx.fillStyle = segment.item.type === "pause" ? "rgba(65, 82, 108, 0.11)" : "rgba(21, 111, 91, 0.12)";
+            ctx.fillRect(x, 0, w, height);
+            ctx.strokeStyle = segment.item.type === "pause" ? "rgba(65, 82, 108, 0.55)" : "rgba(21, 111, 91, 0.72)";
+            ctx.beginPath();
+            ctx.moveTo(x, 0);
+            ctx.lineTo(x, height);
+            ctx.stroke();
+          }
+
+          const samplesPerPixel = Math.max(1, Math.floor(output.length / width));
+          const center = height * 0.54;
+          const scale = height * 0.38;
+          ctx.beginPath();
+          ctx.strokeStyle = "#2f6759";
+          ctx.lineWidth = 1;
+          for (let x = 0; x < width; x += 1) {
+            const start = x * samplesPerPixel;
+            let min = 1;
+            let max = -1;
+            for (let i = 0; i < samplesPerPixel && start + i < output.length; i += 1) {
+              const value = output[start + i];
+              min = Math.min(min, value);
+              max = Math.max(max, value);
+            }
+            ctx.moveTo(x + 0.5, center + min * scale);
+            ctx.lineTo(x + 0.5, center + max * scale);
+          }
+          ctx.stroke();
+        };
+
+        if (cancelled) return;
+        setSegments(visibleSegments);
+        setTotalMs(Math.round((totalSamples / sampleRate) * 1000));
+        redraw();
+        resizeObserver = new ResizeObserver(redraw);
+        if (canvas.parentElement) resizeObserver.observe(canvas.parentElement);
+        setStatus("ready");
+      } catch {
+        if (!cancelled) setStatus("error");
+      }
+    }
+
+    void buildOutputWave();
+    return () => {
+      cancelled = true;
+      resizeObserver?.disconnect();
+      void audioContext?.close();
+    };
+  }, [items, recordings]);
+
+  if (!items.length) return null;
+
+  return (
+    <div className="output-timeline">
+      <div className="output-timeline-head">
+        <strong>输出音轨预览</strong>
+        <span>{(totalMs / 1000).toFixed(2)}s</span>
+      </div>
+      <div className="output-wave">
+        <canvas ref={canvasRef} />
+        {status !== "ready" && <span className="output-wave-status">{status === "loading" ? "正在绘制输出波形..." : "输出波形不可用"}</span>}
+        {segments.map((segment, index) => (
+          <React.Fragment key={segment.item.id}>
+            <div className="output-insert-marker" style={{ left: `${segment.left}%` }} onDragOver={(event) => event.preventDefault()} onDrop={(event) => onInsertDrop(event, index)} title="拖到这里插入" />
+            <div
+              className={`output-wave-item ${segment.item.type}`}
+              draggable
+              onDragStart={(event) => event.dataTransfer.setData("application/json", JSON.stringify({ reorderId: segment.item.id }))}
+              style={{ left: `${segment.left}%`, width: `${segment.width}%` }}
+              title={`${segment.item.text} / ${(segment.durationMs / 1000).toFixed(3)}s`}
+            />
+          </React.Fragment>
+        ))}
+        <div className="output-insert-marker end" style={{ left: "100%" }} onDragOver={(event) => event.preventDefault()} onDrop={(event) => onInsertDrop(event, items.length)} title="拖到这里插入" />
+      </div>
+      <div className="output-label-track">
+        {segments.map((segment) => (
+          <div
+            className={`output-label-item ${segment.item.type}`}
+            draggable
+            key={segment.item.id}
+            onDragStart={(event) => event.dataTransfer.setData("application/json", JSON.stringify({ reorderId: segment.item.id }))}
+            style={{ left: `${segment.left}%`, width: `${segment.width}%` }}
+            title={`${segment.item.text} / ${(segment.durationMs / 1000).toFixed(3)}s`}
+          >
+            <span>{segment.item.text}</span>
+            <small>{(segment.durationMs / 1000).toFixed(2)}s</small>
+            <button onClick={() => onRemove(segment.item.id)}>
+              <Trash2 size={12} />
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function RecordingWaveform({ recording, onSelect }: { recording: Recording; onSelect: (phrase: Phrase) => void }) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [status, setStatus] = useState("loading");
+  const duration = recording.duration || 1;
+
+  useEffect(() => {
+    let cancelled = false;
+    let audioContext: AudioContext | null = null;
+    let resizeObserver: ResizeObserver | null = null;
+    async function drawWaveform() {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      setStatus("loading");
+      try {
+        const res = await fetch(recording.audioUrl);
+        const data = await res.arrayBuffer();
+        const audioWindow = window as typeof window & { webkitAudioContext?: typeof AudioContext };
+        const AudioContextClass = audioWindow.AudioContext || audioWindow.webkitAudioContext;
+        if (!AudioContextClass) return setStatus("unsupported");
+        audioContext = new AudioContextClass();
+        const buffer = await audioContext.decodeAudioData(data.slice(0));
+        if (cancelled) return;
+        const redraw = () => {
+          const parentWidth = canvas.parentElement?.clientWidth || 720;
+          const dpr = window.devicePixelRatio || 1;
+          const width = Math.max(320, Math.floor(parentWidth));
+          const height = 92;
+          canvas.width = Math.floor(width * dpr);
+          canvas.height = Math.floor(height * dpr);
+          canvas.style.width = `${width}px`;
+          canvas.style.height = `${height}px`;
+          const ctx = canvas.getContext("2d");
+          if (!ctx) return;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          ctx.clearRect(0, 0, width, height);
+          ctx.fillStyle = "#f7faf8";
+          ctx.fillRect(0, 0, width, height);
+          ctx.strokeStyle = "#d9e0dc";
+          ctx.strokeRect(0.5, 0.5, width - 1, height - 1);
+
+          const channel = buffer.getChannelData(0);
+          const samplesPerPixel = Math.max(1, Math.floor(channel.length / width));
+          const center = height * 0.48;
+          const scale = height * 0.38;
+          ctx.beginPath();
+          ctx.strokeStyle = "#537367";
+          ctx.lineWidth = 1;
+          for (let x = 0; x < width; x += 1) {
+            const start = x * samplesPerPixel;
+            let min = 1;
+            let max = -1;
+            for (let i = 0; i < samplesPerPixel && start + i < channel.length; i += 1) {
+              const value = channel[start + i];
+              min = Math.min(min, value);
+              max = Math.max(max, value);
+            }
+            ctx.moveTo(x + 0.5, center + min * scale);
+            ctx.lineTo(x + 0.5, center + max * scale);
+          }
+          ctx.stroke();
+
+          const sourceDuration = recording.duration || buffer.duration || 1;
+          for (const phrase of recording.phrases) {
+            if (phrase.kind !== "clip") continue;
+            const startX = Math.max(0, Math.min(width, (phrase.start / sourceDuration) * width));
+            const endX = Math.max(startX + 1, Math.min(width, (phrase.end / sourceDuration) * width));
+            ctx.fillStyle = phrase.quality === "bad" ? "rgba(196, 77, 77, 0.2)" : phrase.quality === "warn" ? "rgba(224, 177, 63, 0.2)" : "rgba(21, 111, 91, 0.16)";
+            ctx.fillRect(startX, 0, endX - startX, height);
+            for (const segment of phraseSegments(phrase)) {
+              const segmentStartX = Math.max(0, Math.min(width, (segment.start / sourceDuration) * width));
+              const segmentEndX = Math.max(segmentStartX + 1, Math.min(width, (segment.end / sourceDuration) * width));
+              ctx.fillStyle = phrase.quality === "bad" ? "rgba(196, 77, 77, 0.24)" : phrase.quality === "warn" ? "rgba(224, 177, 63, 0.24)" : "rgba(21, 111, 91, 0.24)";
+              ctx.fillRect(segmentStartX, 0, segmentEndX - segmentStartX, height);
+            }
+            for (const gap of phrase.removedGaps || []) {
+              const gapStartX = Math.max(0, Math.min(width, (gap.start / sourceDuration) * width));
+              const gapEndX = Math.max(gapStartX + 1, Math.min(width, (gap.end / sourceDuration) * width));
+              ctx.fillStyle = "rgba(90, 100, 110, 0.12)";
+              ctx.fillRect(gapStartX, 0, gapEndX - gapStartX, height);
+            }
+            ctx.strokeStyle = phrase.quality === "bad" ? "rgba(196, 77, 77, 0.75)" : phrase.quality === "warn" ? "rgba(176, 133, 36, 0.75)" : "rgba(21, 111, 91, 0.7)";
+            ctx.beginPath();
+            ctx.moveTo(startX, 0);
+            ctx.lineTo(startX, height);
+            ctx.moveTo(endX, 0);
+            ctx.lineTo(endX, height);
+            ctx.stroke();
+          }
+        };
+        redraw();
+        resizeObserver = new ResizeObserver(redraw);
+        if (canvas.parentElement) resizeObserver.observe(canvas.parentElement);
+        setStatus("ready");
+      } catch {
+        if (!cancelled) setStatus("error");
+      }
+    }
+    void drawWaveform();
+    return () => {
+      cancelled = true;
+      resizeObserver?.disconnect();
+      void audioContext?.close();
+    };
+  }, [recording.audioUrl, recording.duration, recording.phrases]);
+
+  function handleClick(event: React.MouseEvent<HTMLCanvasElement>) {
+    const canvas = canvasRef.current;
+    if (!canvas || !duration) return;
+    const rect = canvas.getBoundingClientRect();
+    const time = ((event.clientX - rect.left) / rect.width) * duration;
+    const phrase = recording.phrases.find((item) => item.kind === "clip" && time >= item.start && time <= item.end);
+    if (phrase) onSelect(phrase);
+  }
+
+  return (
+    <div className="waveform">
+      <canvas ref={canvasRef} onClick={handleClick} />
+      <div className="waveform-words">
+        {recording.phrases.filter((phrase) => phrase.kind === "clip").map((phrase) => {
+          const left = Math.max(0, Math.min(100, (phrase.start / duration) * 100));
+          const right = Math.max(left, Math.min(100, (phrase.end / duration) * 100));
+          return (
+            <button
+              className={`waveform-word ${phrase.quality}`}
+              draggable
+              key={phrase.id}
+              onClick={() => onSelect(phrase)}
+              onDragStart={(event) => event.dataTransfer.setData("application/json", JSON.stringify({ type: "clip", recordingId: recording.id, phraseId: phrase.id, text: phrase.text, recordingName: recording.name }))}
+              style={{ left: `${left}%`, width: `${Math.max(0.8, right - left)}%` }}
+              title={`${phrase.text} / ${phrase.start}s - ${phrase.end}s`}
+            >
+              {phrase.text}
+            </button>
+          );
+        })}
+      </div>
+      {status !== "ready" && <span>{status === "loading" ? "正在绘制波形..." : "波形不可用"}</span>}
+    </div>
+  );
+}
+
+function PhraseInspector({ recording, phrase, onPatch }: { recording?: Recording; phrase: Phrase; onPatch: (patch: Partial<Phrase>) => Promise<void> }) {
   const [text, setText] = useState(phrase.text);
   const [start, setStart] = useState(String(phrase.start));
   const [end, setEnd] = useState(String(phrase.end));
@@ -708,9 +948,7 @@ function PhraseInspector({
     setEnd(String(phrase.end));
   }, [phrase]);
 
-  const previewUrl = recording
-    ? `${recording.audioUrl}#t=${Math.max(0, Number(start) || 0)},${Math.max(Number(start) || 0, Number(end) || 0)}`
-    : "";
+  const previewUrl = recording ? `${recording.audioUrl}#t=${Math.max(0, Number(start) || 0)},${Math.max(Number(start) || 0, Number(end) || 0)}` : "";
 
   return (
     <div className="inspector-form">
@@ -736,9 +974,49 @@ function PhraseInspector({
           右扩
         </button>
       </div>
-      {recording && (
-        <audio src={previewUrl} controls />
-      )}
+      {recording && <audio src={previewUrl} controls />}
+      <div className="boundary-debug">
+        {phrase.anchor && (
+          <div>
+            <strong>Anchor</strong>
+            <span>
+              {phrase.anchor.start}s - {phrase.anchor.end}s
+            </span>
+          </div>
+        )}
+        {!!phrase.segments?.length && (
+          <div>
+            <strong>Segments</strong>
+            <span>{phrase.segments.map((segment) => `${segment.start}-${segment.end}`).join(" / ")}</span>
+          </div>
+        )}
+        {!!phrase.removedGaps?.length && (
+          <div>
+            <strong>Gaps</strong>
+            <span>{phrase.removedGaps.map((gap) => `${gap.start}-${gap.end}`).join(" / ")}</span>
+          </div>
+        )}
+        {!!phrase.boundaryCuts?.length && (
+          <div>
+            <strong>Cuts</strong>
+            <span>{phrase.boundaryCuts.map((cut) => `${cut.at}s`).join(" / ")}</span>
+          </div>
+        )}
+        {phrase.scores && (
+          <div>
+            <strong>Signal</strong>
+            <span>
+              noise {phrase.scores.noiseFloorDb}dB / release {phrase.scores.releaseThresholdDb}dB / {phrase.scores.vadSource}
+            </span>
+          </div>
+        )}
+        {phrase.ownership && (
+          <div>
+            <strong>Ownership</strong>
+            <span>{phrase.ownership}</span>
+          </div>
+        )}
+      </div>
       <button className="primary" onClick={() => void onPatch({ text, start: Number(start), end: Number(end) })}>
         <Play size={18} />
         保存
